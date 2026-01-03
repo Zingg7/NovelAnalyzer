@@ -1,0 +1,6 @@
+.env
+*.pyc
+*.json
+*.md
+only_analyze_writing.py
+__pycache__/
