@@ -129,11 +129,15 @@ async def check_writing_quality(client, sample_text, model_version, write_qualit
             print(f"Lite check failed: {e}")
             error_str = str(e).lower()
             is_retryable = any(x in error_str for x in ["429", "rate limit", "500", "503", "504"])
-            if attempt < max_retries - 1 and is_retryable:
-                wait_time = 15 * (attempt + 1) + random.uniform(0, 1)
-                # wait_time = random.uniform(0, 1)
-                await asyncio.sleep(wait_time)
-                continue
+            if attempt < max_retries - 1:
+                if is_retryable:
+                    wait_time = 15 * (attempt + 1) + random.uniform(0, 1)
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    wait_time = random.uniform(0, 1)
+                    await asyncio.sleep(wait_time)
+                    continue
             return {"writing_score": 0, "evidence_paragraph": f"Error: {e}"}
     return {"writing_score": 0, "evidence_paragraph": "Max retries reached"}
 
@@ -143,7 +147,7 @@ async def call_generate_content(client, model_version, user_message, system_inst
     """
     config_params = {
         "system_instruction": system_instruction,
-        "temperature": 0.3,
+        "temperature": 0,
         "response_mime_type": "application/json",
         "safety_settings": [
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -211,7 +215,7 @@ async def analyze_file(file_path, semaphore, client, standard_content, write_qua
                     "raw_output": raw_context
                 }
 
-        # 2. Proceed to full analysis if score >= 6.0
+        # 2. Proceed to full analysis if score >= 5.5
         system_instruction = standard_content
         
         user_message = f"Text Content:\n{text_content}"
@@ -230,11 +234,16 @@ async def analyze_file(file_path, semaphore, client, standard_content, write_qua
                     error_str = str(e).lower()
                     is_retryable = any(x in error_str for x in ["429", "rate limit", "500", "503", "504"])
                     
-                    if is_retryable and attempt < max_retries - 1:
-                        # 40s per retry as requested
-                        wait_time = 15 * (attempt + 1) + random.uniform(0, 1)
-                        await asyncio.sleep(wait_time)
-                        continue
+                    if attempt < max_retries - 1:
+                        if is_retryable:
+                            # 15s per retry as requested
+                            wait_time = 15 * (attempt + 1) + random.uniform(0, 1)
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            wait_time = random.uniform(0, 1)
+                            await asyncio.sleep(wait_time)
+                            continue
                     raise e # Re-raise if not retryable or max retries reached
 
             
