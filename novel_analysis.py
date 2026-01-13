@@ -15,8 +15,12 @@ load_dotenv()
 
 # --- CONFIGURATION ---
 # Configuration is loaded from .env file
+BATCH_SIZE = 1  # Max concurrent API calls
 
-BATCH_SIZE = 1  # Max concurrent API callsX
+# --- GLOBAL ERROR TRACKING ---
+total_rate_limit_errors = 0
+MAX_RATE_LIMIT_ERRORS = 10
+STOP_ANALYSIS = False
 
 def extract_json(text):
     """
@@ -107,11 +111,17 @@ async def check_writing_quality(client, sample_text, model_version, write_qualit
     """
     Lite check for writing quality based on the first 30k characters.
     """
+    global total_rate_limit_errors, STOP_ANALYSIS
+    if STOP_ANALYSIS:
+         return {"writing_score": 0, "evidence_paragraph": "Analysis stopped due to excessive rate limits (429)."}
+
     system_instruction = write_quality_standard_content
     user_message = f"Text Content:\n{sample_text}"
     max_retries = 4
     for attempt in range(max_retries):
+        if STOP_ANALYSIS: break
         print(f"Attempt {attempt + 1} of {max_retries} for writing quality check...")
+
         try:
             response = await call_generate_content(client, model_version, user_message, system_instruction, enable_thinking=False)
             if not response.text:
@@ -128,7 +138,15 @@ async def check_writing_quality(client, sample_text, model_version, write_qualit
         except Exception as e:
             print(f"Lite check failed: {e}")
             error_str = str(e).lower()
-            is_retryable = any(x in error_str for x in ["429", "rate limit", "500", "503", "504"])
+            is_rate_limit = any(x in error_str for x in ["429", "rate limit"])
+            is_retryable = is_rate_limit or any(x in error_str for x in ["500", "503", "504"])
+            
+            if is_rate_limit:
+                total_rate_limit_errors += 1
+                if total_rate_limit_errors > MAX_RATE_LIMIT_ERRORS:
+                    STOP_ANALYSIS = True
+                    return {"writing_score": 0, "evidence_paragraph": "Stopped: Exceeded 10 Rate Limit Errors (429)."}
+
             if attempt < max_retries - 1:
                 if is_retryable:
                     wait_time = 15 * (attempt + 1) + random.uniform(0, 1)
@@ -145,6 +163,9 @@ async def call_generate_content(client, model_version, user_message, system_inst
     """
     Helper function to call the Gemini API with the specific configuration for full analysis.
     """
+    if STOP_ANALYSIS:
+        raise Exception("429: Rate limit threshold exceeded (Global Stop).")
+
     config_params = {
         "system_instruction": system_instruction,
         "temperature": 0,
@@ -171,11 +192,18 @@ async def analyze_file(file_path, semaphore, client, standard_content, write_qua
     """
     Sends the pre-processed text to the LLM for analysis using the new google-genai SDK.
     """
+    global total_rate_limit_errors, STOP_ANALYSIS
+    clean_name = re.sub(r'\.txt$', '', str(file_path).split('\\')[-1])
+    
+    if STOP_ANALYSIS:
+        return {"file": clean_name, "error": "Analysis stopped due to excessive rate limits (429)."}
+
     async with semaphore:
         # Add jitter to stagger the burst of requests
         await asyncio.sleep(random.uniform(0.1, 2.0))
         
         text_content = preprocess_text(file_path)
+
         if not text_content:
             return None
 
@@ -215,8 +243,9 @@ async def analyze_file(file_path, semaphore, client, standard_content, write_qua
                     "raw_output": raw_context
                 }
 
-        # 2. Proceed to full analysis if score >= 5.5
+        # 2. Proceed to full analysis if score >= 6.0
         system_instruction = standard_content
+
         
         user_message = f"Text Content:\n{text_content}"
 
@@ -226,14 +255,23 @@ async def analyze_file(file_path, semaphore, client, standard_content, write_qua
             # Simple retry logic for 429 Rate Limit and common transient errors
             max_retries = 4
             for attempt in range(max_retries):
+                if STOP_ANALYSIS: break
                 print(f"Attempt {attempt + 1} of {max_retries} for full analysis...")
+
                 try:
                     response = await call_generate_content(client, model_version, user_message, system_instruction)
                     break # Success!
                 except Exception as e:
                     error_str = str(e).lower()
-                    is_retryable = any(x in error_str for x in ["429", "rate limit", "500", "503", "504"])
+                    is_rate_limit = any(x in error_str for x in ["429", "rate limit"])
+                    is_retryable = is_rate_limit or any(x in error_str for x in ["500", "503", "504"])
                     
+                    if is_rate_limit:
+                        total_rate_limit_errors += 1
+                        if total_rate_limit_errors > MAX_RATE_LIMIT_ERRORS:
+                            STOP_ANALYSIS = True
+                            return {"file": clean_name, "error": "Stopped: Exceeded 10 Rate Limit Errors (429)."}
+
                     if attempt < max_retries - 1:
                         if is_retryable:
                             # 15s per retry as requested
@@ -395,7 +433,11 @@ async def main():
 
     
     for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Analyzing"):
+        if STOP_ANALYSIS:
+            print(f"\nCRITICAL: Detected more than {MAX_RATE_LIMIT_ERRORS} Rate Limit Errors (429). Stopping analysis.")
+            break
         res = await f
+
         if res:
             # Directly append the result as it now contains the full JSON + file metadata
             results.append(res)
