@@ -9,13 +9,14 @@ from google import genai
 from google.genai import types
 from tqdm.asyncio import tqdm
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 
 # Load environment variables from .env file
 load_dotenv()
 
 # --- CONFIGURATION ---
 # Configuration is loaded from .env file
-BATCH_SIZE = 1  # Max concurrent API calls
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 1))  # Max concurrent API calls
 
 # --- GLOBAL ERROR TRACKING ---
 total_rate_limit_errors = 0
@@ -107,7 +108,7 @@ def preprocess_text(file_path):
         print(f"Error processing {file_path}: {e}")
         return None
 
-async def check_writing_quality(client, sample_text, model_version, write_quality_standard_content):
+async def check_writing_quality(client, model_version, sample_text, write_quality_standard_content):
     """
     Lite check for writing quality based on the first 30k characters.
     """
@@ -123,11 +124,11 @@ async def check_writing_quality(client, sample_text, model_version, write_qualit
         print(f"Attempt {attempt + 1} of {max_retries} for writing quality check...")
 
         try:
-            response = await call_generate_content(client, model_version, user_message, system_instruction, enable_thinking=False)
-            if not response.text:
+            response_data = await call_generate_content(client, model_version, user_message, system_instruction, enable_thinking=False)
+            if not response_data.get("text"):
                 raise ValueError("Lite check: AI returned no text (possibly blocked by safety).")
                 
-            raw_text = response.text.strip()
+            raw_text = response_data["text"].strip()
             
             # Use the new robust extraction
             result = extract_json(raw_text)
@@ -158,37 +159,85 @@ async def check_writing_quality(client, sample_text, model_version, write_qualit
                     continue
             return {"writing_score": 0, "evidence_paragraph": f"Error: {e}"}
     return {"writing_score": 0, "evidence_paragraph": "Max retries reached"}
-
 async def call_generate_content(client, model_version, user_message, system_instruction, enable_thinking=True):
     """
-    Helper function to call the Gemini API with the specific configuration for full analysis.
+    Helper function to call the Gemini API or OpenAI API based on the client type.
     """
     if STOP_ANALYSIS:
         raise Exception("429: Rate limit threshold exceeded (Global Stop).")
 
-    config_params = {
-        "system_instruction": system_instruction,
-        "temperature": 0,
-        "response_mime_type": "application/json",
-        "safety_settings": [
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
-        ]
-    }
-    
-    if enable_thinking:
-        config_params["thinking_config"] = types.ThinkingConfig(thinking_level="high")
+    if isinstance(client, genai.Client):
+        # Google Native Path
+        config_params = {
+            "system_instruction": system_instruction,
+            "temperature": 0,
+            "response_mime_type": "application/json",
+            "safety_settings": [
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+            ]
+        }
+        
+        if enable_thinking:
+            config_params["thinking_config"] = types.ThinkingConfig(thinking_level="high")
 
-    return await client.aio.models.generate_content(
-        model=model_version,
-        contents=user_message,
-        config=types.GenerateContentConfig(**config_params)
-    )
+        response = await client.aio.models.generate_content(
+            model=model_version,
+            contents=user_message,
+            config=types.GenerateContentConfig(**config_params)
+        )
+        
+        usage = {
+            "prompt_tokens": 0,
+            "candidates_tokens": 0,
+            "total_tokens": 0
+        }
+        if hasattr(response, 'usage_metadata') and response.usage_metadata:
+            usage = {
+                "prompt_tokens": response.usage_metadata.prompt_token_count,
+                "candidates_tokens": response.usage_metadata.candidates_token_count,
+                "total_tokens": response.usage_metadata.total_token_count
+            }
+        
+        return {
+            "text": response.text,
+            "usage": usage
+        }
+    else:
+        # OpenAI-Compatible Path
+        messages = []
+        if system_instruction:
+            messages.append({"role": "system", "content": system_instruction})
+        messages.append({"role": "user", "content": user_message})
+        
+        response = await client.chat.completions.create(
+            model=model_version,
+            messages=messages,
+            temperature=0,
+            response_format={"type": "json_object"}
+        )
+        
+        usage = {
+            "prompt_tokens": 0,
+            "candidates_tokens": 0,
+            "total_tokens": 0
+        }
+        if hasattr(response, 'usage') and response.usage:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "candidates_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens
+            }
 
-async def analyze_file(file_path, semaphore, client, standard_content, write_quality_standard_content):
+        return {
+            "text": response.choices[0].message.content,
+            "usage": usage
+        }
+
+async def analyze_file(file_path, semaphore, client, model_version, standard_content, write_quality_standard_content):
     """
     Sends the pre-processed text to the LLM for analysis using the new google-genai SDK.
     """
@@ -208,14 +257,14 @@ async def analyze_file(file_path, semaphore, client, standard_content, write_qua
             return None
 
         clean_name = re.sub(r'\.txt$', '', str(file_path).split('\\')[-1])
-        model_version = os.environ.get("MODEL_VERSION", "gemini-3-flash-preview")
+        # model_version is now set by global provider config
 
         # Lite check for writing quality to early exit
         if os.environ.get("ENABLE_QUICK_QUALITY_CHECK", "false").lower() == "true":
             try:
                 sample_size = int(os.environ.get("SAMPLE_SIZE", 30000))
                 sample_text = text_content[:sample_size]
-                lite_check = await check_writing_quality(client, sample_text, model_version, write_quality_standard_content)
+                lite_check = await check_writing_quality(client, model_version, sample_text, write_quality_standard_content)
                 
                 rating = lite_check.get("rating", 0)
                 dimension_rating = lite_check.get("dimension_rating", "")
@@ -250,16 +299,16 @@ async def analyze_file(file_path, semaphore, client, standard_content, write_qua
         user_message = f"Text Content:\n{text_content}"
 
         try:
-            model_version = os.environ.get("MODEL_VERSION")
+            # model_version is now set by global provider config
             
             # Simple retry logic for 429 Rate Limit and common transient errors
-            max_retries = 4
+            max_retries = 1
             for attempt in range(max_retries):
                 if STOP_ANALYSIS: break
                 print(f"Attempt {attempt + 1} of {max_retries} for full analysis...")
 
                 try:
-                    response = await call_generate_content(client, model_version, user_message, system_instruction)
+                    response_data = await call_generate_content(client, model_version, user_message, system_instruction)
                     break # Success!
                 except Exception as e:
                     error_str = str(e).lower()
@@ -285,11 +334,11 @@ async def analyze_file(file_path, semaphore, client, standard_content, write_qua
                     raise e # Re-raise if not retryable or max retries reached
 
             
-            if not response.text:
+            if not response_data.get("text"):
                 error_details = "AI returned no text."                
                 raise ValueError(error_details)
             
-            raw_text = response.text.strip()
+            raw_text = response_data["text"].strip()
 
             result = extract_json(raw_text)
 
@@ -310,11 +359,7 @@ async def analyze_file(file_path, semaphore, client, standard_content, write_qua
             # Construct the final dictionary with 'file' at the beginning
             final_result = {"file": clean_name}
             final_result.update(result)
-            final_result["usage"] = { 
-                "prompt_tokens": response.usage_metadata.prompt_token_count,
-                "candidates_tokens": response.usage_metadata.candidates_token_count,
-                "total_tokens": response.usage_metadata.total_token_count
-            }
+            final_result["usage"] = response_data["usage"]
             
             return final_result
 
@@ -331,14 +376,13 @@ async def analyze_file(file_path, semaphore, client, standard_content, write_qua
                 "raw_output": raw_context
             }
 
-async def analyze_file_pessimistic(file_path, semaphore, client, standard_content, write_quality_standard_content):
+async def analyze_file_pessimistic(file_path, semaphore, client, model_version, standard_content, write_quality_standard_content):
     """
     Calls analyze_file twice and returns the result with the lower rating.
     """
-    # Run both analyses concurrently
     res1, res2 = await asyncio.gather(
-        analyze_file(file_path, semaphore, client, standard_content, write_quality_standard_content),
-        analyze_file(file_path, semaphore, client, standard_content, write_quality_standard_content)
+        analyze_file(file_path, semaphore, client, model_version, standard_content, write_quality_standard_content),
+        analyze_file(file_path, semaphore, client, model_version, standard_content, write_quality_standard_content)
     )
     
     # Selection logic
@@ -374,13 +418,26 @@ async def main():
     write_quality_standard_content = write_quality_standard_path.read_text(encoding='utf-8', errors='ignore')
     print("Loaded analysis standard.")
 
-    # Get API Key
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        api_key = input("Enter your Google API Key: ").strip()
+    # --- PROVIDER SELECTION ---
+    provider = os.environ.get("API_PROVIDER", "GOOGLE").upper()
     
-    # Initialize the new SDK client
-    client = genai.Client(api_key=api_key, http_options={'api_version': 'v1alpha'})
+    if provider == "GOOGLE":
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            api_key = input("Enter your Google API Key: ").strip()
+        client = genai.Client(api_key=api_key, http_options={'api_version': 'v1alpha'})
+        model_version = os.environ.get("MODEL_VERSION", "gemini-3-flash-preview")
+        print(f"Using Google Native Provider ({model_version})")
+    else:
+        openai_key = os.environ.get("OPENAI_API_KEY")
+        base_url = os.environ.get("OPENAI_BASE_URL")
+        model_version = os.environ.get("OPENAI_MODEL_NAME")
+        
+        if not openai_key:
+            openai_key = input("Enter your OpenAI/Compatible API Key: ").strip()
+        
+        client = AsyncOpenAI(api_key=openai_key, base_url=base_url)
+        print(f"Using OpenAI-Compatible Provider: {base_url} ({model_version})")
 
     # Get Folder Path
     folder_path = os.environ.get("FOLDER_PATH")
@@ -405,10 +462,10 @@ async def main():
     # Process files=
     if os.environ.get("ENABLE_DUAL_PASS", "false").lower() == "true":
         print(f"Starting analysis (Dual-Pass enabled: {len(all_files)} files)...")
-        tasks = [analyze_file_pessimistic(f, semaphore, client, standard_content, write_quality_standard_content) for f in all_files]
+        tasks = [analyze_file_pessimistic(f, semaphore, client, model_version, standard_content, write_quality_standard_content) for f in all_files]
     else:
         print(f"Starting analysis (Single-Pass enabled: {len(all_files)} files)...")
-        tasks = [analyze_file(f, semaphore, client, standard_content, write_quality_standard_content) for f in all_files]
+        tasks = [analyze_file(f, semaphore, client, model_version, standard_content, write_quality_standard_content) for f in all_files]
     results = []
     
     total_prompt_tokens = 0
